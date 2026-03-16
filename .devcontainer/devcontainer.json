@@ -1,0 +1,47 @@
+{
+  "name": "zsh-ai-plugin",
+  "features": {
+    "ghcr.io/stu-bell/devcontainer-features/claude-code:0": {},
+    "ghcr.io/devcontainers-extra/features/fzf:1": {},
+    "ghcr.io/rocker-org/devcontainer-features/apt-packages:1": {
+      "packages": "pandoc,ripgrep"
+    }
+  },
+  "forwardPorts": [8081],
+  "portsAttributes": {
+    "8081": { "label": "mitmweb UI", "protocol": "http" }
+  },
+  "postCreateCommand": "bash /zsh-ai-plugin/.devcontainer/postcreate.sh",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "workspaceFolder": "/zsh-ai-plugin",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "Anthropic.claude-code",
+        "dendron.dendron",
+        "yzhang.markdown-all-in-one",
+        "davidanson.vscode-markdownlint",
+        "eamodio.gitlens",
+        "jackiotyu.git-worktree-manager"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.wordWrap": "on",
+        "editor.defaultFormatter": "yzhang.markdown-all-in-one",
+        "[markdown]": {
+          "editor.defaultFormatter": "yzhang.markdown-all-in-one"
+        },
+        "task.allowAutomaticTasks": "on",
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": { "path": "bash", "icon": "terminal-bash" },
+          "zsh": { "path": "zsh" }
+        }
+      }
+    }
+  },
+  "remoteUser": "vscode",
+  "postStartCommand": "bash /zsh-ai-plugin/.devcontainer/poststart.sh",
+  "waitFor": "postStartCommand"
+}

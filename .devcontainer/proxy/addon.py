@@ -1,0 +1,370 @@
+"""
+mitmproxy addon for the Claude devcontainer proxy.
+
+Responsibilities:
+  - Blocks requests to domains not in the allowlist (clear 403)
+  - Injects real tokens into outbound requests (replacing dummies)
+  - Captures real tokens from OAuth responses, persists them,
+    and rewrites the response to return dummies back to Claude Code
+  - Scrubs real token strings from all response bodies (safety net)
+"""
+
+import json
+import logging
+import os
+import shutil
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
+from urllib.parse import parse_qs, urlencode
+
+from mitmproxy import ctx, http
+
+log = logging.getLogger("addon")
+
+CREDENTIALS_FILE = "/data/credentials.json"
+CERT_DEST = "/certs/mitmca.pem"
+
+DUMMY_ACCESS_TOKEN = "dummy-access-token"
+DUMMY_REFRESH_TOKEN = "dummy-refresh-token"
+
+OAUTH_HOST = "platform.claude.com"
+OAUTH_PATH = "/v1/oauth/token"
+
+# Allowed domains — loaded from ALLOWED_DOMAINS env var (space-separated),
+# set by start.sh from the same list used for the ipset firewall.
+_ALLOWED_DOMAINS: set[str] = set()
+_raw = os.environ.get("ALLOWED_DOMAINS", "")
+if _raw:
+    _ALLOWED_DOMAINS = {d.strip() for d in _raw.split() if d.strip()}
+    log.info("Loaded %d allowed domains", len(_ALLOWED_DOMAINS))
+
+
+def _is_domain_allowed(host: str) -> bool:
+    """Check if a host matches any allowed domain (exact or subdomain)."""
+    if not _ALLOWED_DOMAINS:
+        return True  # no allowlist configured, allow all
+    host = host.lower().rstrip(".")
+    for domain in _ALLOWED_DOMAINS:
+        domain = domain.lower().rstrip(".")
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
+# Content-types that are safe to decode as text and scrub
+_TEXT_CONTENT_TYPES = (
+    "text/",
+    "application/json",
+    "application/xml",
+    "application/x-www-form-urlencoded",
+    "application/javascript",
+)
+
+
+def _mask(token: str) -> str:
+    if len(token) <= 12:
+        return "***"
+    return f"{token[:6]}...{token[-6:]}"
+
+
+# ---------------------------------------------------------------------------
+# Credentials store
+# ---------------------------------------------------------------------------
+
+class CredentialsStore:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        self._creds: Optional[dict] = None
+        self._load()
+
+    def _load(self) -> None:
+        with self._lock:
+            if os.path.exists(self.path):
+                try:
+                    with open(self.path) as f:
+                        self._creds = json.load(f)
+                    log.info("Loaded credentials from %s", self.path)
+                except (json.JSONDecodeError, OSError, ValueError) as e:
+                    log.warning("Failed to load credentials: %s", e)
+                    self._creds = None
+
+    def save(self, creds: dict) -> None:
+        with self._lock:
+            # Merge with existing credentials so partial updates don't drop tokens
+            self._creds = {**(self._creds or {}), **creds}
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            # Create/truncate with mode 0o600 from the start — no readable window
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(self._creds, f, indent=2)
+            log.info("Saved credentials to %s", self.path)
+
+    @property
+    def access_token(self) -> Optional[str]:
+        with self._lock:
+            return (self._creds or {}).get("access_token")
+
+    @property
+    def refresh_token(self) -> Optional[str]:
+        with self._lock:
+            return (self._creds or {}).get("refresh_token")
+
+    def tokens(self) -> tuple[Optional[str], Optional[str]]:
+        """Return (access_token, refresh_token) as a single atomic read."""
+        with self._lock:
+            creds = self._creds or {}
+            return creds.get("access_token"), creds.get("refresh_token")
+
+    @property
+    def loaded(self) -> bool:
+        with self._lock:
+            return self._creds is not None
+
+
+store = CredentialsStore(CREDENTIALS_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Health HTTP server (port 3100)
+# ---------------------------------------------------------------------------
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/healthz":
+            body = json.dumps({"ok": True, "credentialsLoaded": store.loaded}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args) -> None:  # noqa: ANN001
+        pass  # suppress request logs
+
+
+def _start_health_server() -> None:
+    server = HTTPServer(("127.0.0.1", 3100), HealthHandler)
+    server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# JSON scrubbing helper
+# ---------------------------------------------------------------------------
+
+def _scrub_json(obj, real_access: Optional[str], real_refresh: Optional[str]) -> tuple:
+    """Recursively walk a JSON-decoded structure, replacing token string values.
+
+    Returns (scrubbed_obj, list_of_scrubbed_labels).  Matches only exact string
+    values (not substrings), which avoids false positives while covering any
+    field name the token might appear under.
+    """
+    scrubbed = []
+
+    def _walk(node):
+        if isinstance(node, str):
+            if real_access and node == real_access:
+                scrubbed.append(f"access_token {_mask(real_access)}")
+                return DUMMY_ACCESS_TOKEN
+            if real_refresh and node == real_refresh:
+                scrubbed.append(f"refresh_token {_mask(real_refresh)}")
+                return DUMMY_REFRESH_TOKEN
+            return node
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(obj), scrubbed
+
+
+# ---------------------------------------------------------------------------
+# Addon
+# ---------------------------------------------------------------------------
+
+class TokenSwapAddon:
+    def tls_clienthello(self, data) -> None:
+        """Override server address with SNI hostname.
+
+        In transparent mode via DNS spoofing + iptables REDIRECT, SO_ORIGINAL_DST
+        returns our own IP.  Use the TLS SNI to determine the real upstream host.
+        """
+        sni = data.client_hello.sni
+        if sni and data.context.server.address:
+            port = data.context.server.address[1]
+            data.context.server.address = (sni, port)
+
+    def running(self) -> None:
+        # Publish the mitmproxy CA cert to the shared volume so the
+        # devcontainer postStartCommand can trust it.
+        confdir = os.environ.get("MITMPROXY_CONFDIR", "/data/mitmproxy")
+        src = os.path.join(confdir, "mitmproxy-ca-cert.pem")
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(CERT_DEST), exist_ok=True)
+            shutil.copy2(src, CERT_DEST)
+            log.info("Copied CA cert to %s", CERT_DEST)
+        else:
+            log.warning("CA cert not found at %s (will retry on next run)", src)
+
+        t = threading.Thread(target=_start_health_server, daemon=True)
+        t.start()
+        log.info("Health server started on 127.0.0.1:3100")
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        # Block requests to domains not in the allowlist
+        host = flow.request.pretty_host
+        if not _is_domain_allowed(host):
+            flow.response = http.Response.make(
+                403,
+                f"Blocked by devcontainer proxy: {host} is not in the allowed domains list.\n",
+                {"Content-Type": "text/plain"},
+            )
+            ctx.log.info(f"[domain-filter] blocked request to {host}{flow.request.path}")
+            return
+
+        if not store.loaded:
+            return
+
+        # Swap dummy Bearer token → real access token
+        auth = flow.request.headers.get("authorization", "")
+        if auth == f"Bearer {DUMMY_ACCESS_TOKEN}" and store.access_token:
+            flow.request.headers["authorization"] = f"Bearer {store.access_token}"
+            msg = f"[token-swap] access-token substituted for request to {flow.request.pretty_host}: {DUMMY_ACCESS_TOKEN} → {_mask(store.access_token)}"
+            ctx.log.info(msg)
+            flow.comment = (flow.comment + " | " if flow.comment else "") + f"access-token substituted ({DUMMY_ACCESS_TOKEN} → {_mask(store.access_token)})"
+
+        # Swap dummy refresh_token → real refresh token on OAuth token requests
+        if (
+            flow.request.pretty_host == OAUTH_HOST
+            and flow.request.path == OAUTH_PATH
+            and flow.request.method == "POST"
+        ):
+            self._swap_refresh_in_request(flow)
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        # Capture real tokens from OAuth response, persist, rewrite to dummies
+        if (
+            flow.request.pretty_host == OAUTH_HOST
+            and flow.request.path == OAUTH_PATH
+            and flow.request.method == "POST"
+            and flow.response.status_code == 200
+        ):
+            self._handle_oauth_response(flow)
+            return  # scrub already done inside
+
+        # Safety net: scrub any real token strings from all other responses
+        self._scrub_response(flow)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _swap_refresh_in_request(self, flow: http.HTTPFlow) -> None:
+        real_refresh = store.refresh_token
+        if not real_refresh:
+            return
+        ct = flow.request.headers.get("content-type", "")
+        if "application/json" in ct:
+            try:
+                body = json.loads(flow.request.content)
+                if body.get("refresh_token") == DUMMY_REFRESH_TOKEN:
+                    body["refresh_token"] = real_refresh
+                    flow.request.content = json.dumps(body).encode()
+                    ctx.log.info(f"[token-swap] refresh-token substituted in OAuth request body: {DUMMY_REFRESH_TOKEN} → {_mask(real_refresh)} (JSON)")
+                    flow.comment = (flow.comment + " | " if flow.comment else "") + f"refresh-token substituted ({DUMMY_REFRESH_TOKEN} → {_mask(real_refresh)}, JSON)"
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                log.warning("Failed to parse/swap refresh token in JSON request body: %s", e)
+        elif "application/x-www-form-urlencoded" in ct:
+            params = parse_qs(flow.request.content.decode(), keep_blank_values=True)
+            if params.get("refresh_token") == [DUMMY_REFRESH_TOKEN]:
+                params["refresh_token"] = [real_refresh]
+                flow.request.content = urlencode(params, doseq=True).encode()
+                ctx.log.info(f"[token-swap] refresh-token substituted in OAuth request body: {DUMMY_REFRESH_TOKEN} → {_mask(real_refresh)} (form-encoded)")
+                flow.comment = (flow.comment + " | " if flow.comment else "") + f"refresh-token substituted ({DUMMY_REFRESH_TOKEN} → {_mask(real_refresh)}, form)"
+
+    def _handle_oauth_response(self, flow: http.HTTPFlow) -> None:
+        try:
+            body = json.loads(flow.response.content)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            log.warning("Failed to parse OAuth response body: %s", e)
+            return
+
+        real_access = body.get("access_token")
+        real_refresh = body.get("refresh_token")
+
+        if real_access or real_refresh:
+            new_creds = {}
+            if real_access:
+                new_creds["access_token"] = real_access
+            if real_refresh:
+                new_creds["refresh_token"] = real_refresh
+            store.save(new_creds)
+
+        # Rewrite tokens to dummies before returning to Claude Code
+        changed = []
+        if real_access:
+            body["access_token"] = DUMMY_ACCESS_TOKEN
+            changed.append("access_token")
+        if real_refresh:
+            body["refresh_token"] = DUMMY_REFRESH_TOKEN
+            changed.append("refresh_token")
+
+        flow.response.content = json.dumps(body).encode()
+        if changed:
+            parts = []
+            if real_access:
+                parts.append(f"access_token {_mask(real_access)} → {DUMMY_ACCESS_TOKEN}")
+            if real_refresh:
+                parts.append(f"refresh_token {_mask(real_refresh)} → {DUMMY_REFRESH_TOKEN}")
+            ctx.log.info(f"[token-swap] OAuth response: captured + replaced — {'; '.join(parts)}")
+            flow.comment = (flow.comment + " | " if flow.comment else "") + f"captured+scrubbed: {'; '.join(parts)}"
+
+    def _scrub_response(self, flow: http.HTTPFlow) -> None:
+        real_access, real_refresh = store.tokens()
+        if not real_access and not real_refresh:
+            return
+
+        # Only scrub text-based responses to avoid corrupting binary content
+        ct = flow.response.headers.get("content-type", "")
+        if not any(ct.startswith(t) for t in _TEXT_CONTENT_TYPES):
+            return
+
+        try:
+            text = flow.response.content.decode("utf-8", errors="replace")
+            scrubbed = []
+
+            if "application/json" in ct:
+                # For JSON, walk the structure and replace exact string values.
+                # This avoids false positives from naive substring replacement
+                # (e.g. a token that happens to appear inside an error message).
+                try:
+                    data = json.loads(text)
+                    data, scrubbed = _scrub_json(data, real_access, real_refresh)
+                    if scrubbed:
+                        text = json.dumps(data)
+                except (json.JSONDecodeError, ValueError):
+                    pass  # fall through to text replacement below
+
+            if not scrubbed:
+                # Non-JSON (or unparseable JSON): fall back to substring replacement
+                if real_access and real_access in text:
+                    text = text.replace(real_access, DUMMY_ACCESS_TOKEN)
+                    scrubbed.append(f"access_token {_mask(real_access)}")
+                if real_refresh and real_refresh in text:
+                    text = text.replace(real_refresh, DUMMY_REFRESH_TOKEN)
+                    scrubbed.append(f"refresh_token {_mask(real_refresh)}")
+
+            if scrubbed:
+                flow.response.content = text.encode("utf-8")
+                ctx.log.info(f"[token-swap] scrubbed from response body ({flow.request.pretty_url}): {', '.join(scrubbed)}")
+                flow.comment = (flow.comment + " | " if flow.comment else "") + f"scrubbed: {', '.join(scrubbed)}"
+        except Exception as e:
+            log.warning("Failed to scrub response body for %s: %s", flow.request.pretty_url, e)
+
+
+addons = [TokenSwapAddon()]
