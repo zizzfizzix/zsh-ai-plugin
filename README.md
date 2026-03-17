@@ -1,6 +1,6 @@
 # at-command
 
-An [oh-my-zsh](https://ohmyz.sh/) plugin that transforms natural language requests into executable shell commands using [Claude Code](https://claude.ai/code).
+An [oh-my-zsh](https://ohmyz.sh/) plugin that transforms natural language requests into executable shell commands using [Claude Code](https://claude.ai/code). Inspired by [iafan](https://github.com/iafan/at-command).
 
 Your request is converted to a ready-to-run command and placed in the zsh buffer so you can review (and optionally edit) it before pressing Enter.
 
