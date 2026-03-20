@@ -37,7 +37,28 @@ if [[ ! -f "${AT_COMMAND_PROMPT}" ]]; then
 fi
 unfunction _at_command_default_prompt
 
-@() {
+# In interactive shells, intercept Enter when the line starts with "@ " so that
+# the raw buffer text is passed to _at_command before zsh parses it — this means
+# apostrophes, $vars, !, and other special characters work without escaping.
+# Falls through to normal accept-line for all other input.
+if [[ -o interactive ]]; then
+  _at_command_accept_line() {
+    if [[ "$BUFFER" == "@ "* ]]; then
+      local request="${BUFFER#@ }"
+      BUFFER=""
+      zle reset-prompt
+      _at_command "$request"
+    else
+      zle .accept-line
+    fi
+  }
+  zle -N accept-line _at_command_accept_line
+fi
+
+# Fallback alias for non-interactive use (noglob prevents glob expansion)
+alias @='noglob _at_command'
+
+_at_command() {
   if [[ $# -eq 0 ]]; then
     echo "Usage: @ <natural language request>"
     echo "Example: @ list all jpg files larger than 5mb"
