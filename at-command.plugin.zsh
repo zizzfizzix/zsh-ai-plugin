@@ -46,7 +46,7 @@ if [[ -o interactive ]]; then
     if [[ "$BUFFER" == "@ "* ]]; then
       local request="${BUFFER#@ }"
       BUFFER=""
-      zle reset-prompt
+      echo
       _at_command "$request"
     else
       zle .accept-line
