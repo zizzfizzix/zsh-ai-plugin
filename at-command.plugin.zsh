@@ -114,6 +114,12 @@ _at_command() {
     return 1
   fi
 
-  # Push command into zsh line editor buffer for review before execution
-  print -z "$cmd"
+  # Push command into zsh line editor buffer for review before execution.
+  # Inside a ZLE widget, set BUFFER directly; otherwise use print -z (input stack).
+  if [[ -n "$WIDGET" ]]; then
+    BUFFER="$cmd"
+    zle redisplay
+  else
+    print -z "$cmd"
+  fi
 }
