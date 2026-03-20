@@ -8,6 +8,7 @@ Your request is converted to a ready-to-run command and placed in the zsh buffer
 
 - [oh-my-zsh](https://ohmyz.sh/)
 - [Claude Code CLI](https://claude.ai/code) installed and authenticated (`claude`)
+- [`jq`](https://jqlang.org/) (`brew install jq` / `apt install jq`)
 
 ## Installation
 

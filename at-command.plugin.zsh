@@ -23,7 +23,6 @@ _at_command_default_prompt() {
   cat <<'EOF'
 Convert the user's natural language request into a single executable shell command.
 Rules:
-- Output ONLY the command, nothing else — no explanation, no markdown, no backticks
 - The command must be a single line
 - Do not execute the command
 - Use syntax appropriate for the specified platform and shell
@@ -70,6 +69,11 @@ _at_command() {
     return 1
   fi
 
+  if ! command -v jq &>/dev/null; then
+    echo "[at-command] Error: 'jq' not found. Install it (e.g. brew install jq)." >&2
+    return 1
+  fi
+
   # Strip prompt-delimiter tags from user input to prevent injection
   local request="${${${*}//<end>/}//<request>/}"
   local system_prompt
@@ -86,16 +90,21 @@ _at_command() {
 
   local context="Platform: ${platform}\nShell: ${shell_name}\n\n"
 
-  local cmd claude_status stderr_content stderr_file
+  local schema='{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}'
+
+  local cmd json claude_status stderr_content stderr_file
   stderr_file=$(mktemp) || { echo "[at-command] Failed to create temp file." >&2; return 1; }
 
   # The always{} block runs on normal exit, errors, and signals (Ctrl+C),
   # guaranteeing the terminal is restored and the temp file is removed.
   {
     printf "⏳ thinking... "
-    cmd=$(claude -p --model "${AT_COMMAND_MODEL}" "${context}${system_prompt} <request>${request}<end>" 2>"${stderr_file}" \
-      | grep -v '^[[:space:]]*$' | head -1)
-    claude_status=${pipestatus[1]}
+    json=$(claude -p --model "${AT_COMMAND_MODEL}" \
+      --output-format json \
+      --json-schema "$schema" \
+      "${context}${system_prompt} <request>${request}<end>" 2>"${stderr_file}")
+    claude_status=$?
+    cmd=$(printf '%s' "$json" | jq -r '.structured_output.command // empty')
   } always {
     printf "\r\033[K"
     stderr_content=$(cat "${stderr_file}" 2>/dev/null)
