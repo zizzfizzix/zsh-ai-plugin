@@ -26,7 +26,7 @@ Rules:
 - Output ONLY the command, nothing else — no explanation, no markdown, no backticks
 - The command must be a single line
 - Do not execute the command
-- Use standard POSIX/bash/zsh syntax compatible with macOS and Linux
+- Use syntax appropriate for the specified platform and shell
 EOF
 }
 
@@ -54,6 +54,17 @@ unfunction _at_command_default_prompt
   local system_prompt
   system_prompt=$(cat "${AT_COMMAND_PROMPT}")
 
+  # Detect platform and shell dynamically
+  local platform
+  case "$(uname -s)" in
+    Darwin) platform="macOS" ;;
+    Linux)  platform="Linux" ;;
+    *)      platform="$(uname -s)" ;;
+  esac
+  local shell_name="${SHELL##*/}"
+
+  local context="Platform: ${platform}\nShell: ${shell_name}\n\n"
+
   local cmd claude_status stderr_content stderr_file
   stderr_file=$(mktemp) || { echo "[at-command] Failed to create temp file." >&2; return 1; }
 
@@ -61,7 +72,7 @@ unfunction _at_command_default_prompt
   # guaranteeing the terminal is restored and the temp file is removed.
   {
     printf "⏳ thinking... "
-    cmd=$(claude -p --model "${AT_COMMAND_MODEL}" "${system_prompt} <request>${request}<end>" 2>"${stderr_file}" \
+    cmd=$(claude -p --model "${AT_COMMAND_MODEL}" "${context}${system_prompt} <request>${request}<end>" 2>"${stderr_file}" \
       | grep -v '^[[:space:]]*$' | head -1)
     claude_status=${pipestatus[1]}
   } always {
