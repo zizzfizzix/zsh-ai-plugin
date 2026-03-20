@@ -25,7 +25,7 @@ Convert the user's natural language request into a single executable shell comma
 Rules:
 - The command must be a single line
 - Do not execute the command
-- Use syntax appropriate for the specified platform and shell
+- Use syntax and flags native to the specified platform and shell — prefer platform-native tools (e.g. on macOS use BSD variants, on Linux use GNU variants)
 EOF
 }
 
