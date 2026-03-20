@@ -44,6 +44,7 @@ if [[ -o interactive ]]; then
   _at_command_accept_line() {
     if [[ "$BUFFER" == "@ "* ]]; then
       local request="${BUFFER#@ }"
+      print -s "$BUFFER"  # add the @ ... line to history
       BUFFER=""
       echo
       _at_command "$request"
