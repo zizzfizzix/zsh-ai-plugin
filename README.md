@@ -32,6 +32,13 @@ Your request is converted to a ready-to-run command and placed in the zsh buffer
    source ~/.zshrc
    ```
 
+## Updating
+
+```sh
+git -C ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/at-command pull
+source ~/.zshrc
+```
+
 ## Usage
 
 ```sh
@@ -66,7 +73,7 @@ export AT_COMMAND_PROMPT=~/.config/at_prompt
 
 ### System Prompt
 
-On first use, a default system prompt is created at `~/.at_prompt`. You can customize it to tailor command generation for your environment (e.g. specify your OS, preferred tools, or coding style).
+On first use, a default system prompt is created at `~/.at_prompt`. You can customize it to tailor command generation for your environment (e.g. preferred tools, aliases, or coding style). Your platform and shell are detected and injected automatically.
 
 ## Warning
 
